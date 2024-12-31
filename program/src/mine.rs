@@ -137,36 +137,12 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     // Apply bus limit.
     let reward_actual = reward.min(bus.rewards).min(ONE_ORE);
 
-    // Add the miner to the pool of valid miners.
-    let mut valid_miners: Vec<Pubkey> = Vec::new();
-    if !valid_miners.contains(&signer_info.key) {
-        valid_miners.push(*signer_info.key);
-    }
+    // Update balances.
+    bus.theoretical_rewards = bus.theoretical_rewards.checked_add(reward).unwrap();
+    bus.rewards = bus.rewards.checked_sub(reward_actual).unwrap();
+    proof.balance = proof.balance.checked_add(reward_actual).unwrap();
 
-    // Graceful exit if there are no miners.
-    let num_miners = valid_miners.len() as u64;
-    if num_miners == 0 {
-        return Ok(());
-    }
-
-    // Calculate per-miner share and distribute 31% guaranteed reward.
-    let per_miner_share = reward_actual / num_miners;
-    let guaranteed_share = (per_miner_share as f64 * 0.31) as u64;
-    proof.balance = proof.balance.checked_add(guaranteed_share).unwrap();
-    bus.rewards = bus.rewards.checked_sub(guaranteed_share).unwrap();
-
-    // Pool the remaining 69% for the lottery.
-    let pooled_share = (reward_actual as f64 * 0.69) as u64;
-    let block_hash = hashv(&[slot_hashes_sysvar.data.borrow()]);
-    let miner_index = (block_hash.as_ref()[0] as usize) % valid_miners.len();
-    let selected_miner = valid_miners[miner_index];
-
-    if selected_miner == *signer_info.key {
-        proof.balance = proof.balance.checked_add(pooled_share).unwrap();
-        bus.rewards = bus.rewards.checked_sub(pooled_share).unwrap();
-    }
-
-    // Update stats and log data.
+    // Hash a recent slot hash into the next challenge to prevent pre-mining attacks.
     proof.last_hash = hash.h;
     proof.challenge = hashv(&[
         hash.h.as_slice(),
@@ -174,8 +150,31 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     ])
     .0;
 
-    proof.total_rewards = proof.total_rewards.saturating_add(reward_actual);
+    // Update stats.
+    let prev_last_hash_at = proof.last_hash_at;
+    proof.last_hash_at = t.max(t_target);
     proof.total_hashes = proof.total_hashes.saturating_add(1);
+    proof.total_rewards = proof.total_rewards.saturating_add(reward_actual);
+
+    // Log data.
+    for i in 0..3 {
+        boost_rewards[i] = (boost_rewards[i] as u128)
+            .checked_mul(reward_actual as u128)
+            .unwrap()
+            .checked_div(reward_pre_penalty as u128)
+            .unwrap() as u64;
+    }
+    MineEvent {
+        balance: proof.balance,
+        difficulty: difficulty as u64,
+        last_hash_at: prev_last_hash_at,
+        timing: t.saturating_sub(t_liveness),
+        reward: reward_actual,
+        boost_1: boost_rewards[0],
+        boost_2: boost_rewards[1],
+        boost_3: boost_rewards[2],
+    }
+    .log_return();
 
     Ok(())
 }
