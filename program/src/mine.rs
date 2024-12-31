@@ -164,12 +164,19 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if is_only_miner {
         final_reward = final_reward.saturating_add(pool_reward);
     } else if bus.total_miners > 1 {
-        // If there are multiple miners, use the hash to pick a winner
-        let is_winner = hash.h[0] <= (255 / bus.total_miners); // Probability of 1/total_miners
+        // Use all bytes of the hash for more randomness
+        let slot_hash = &slot_hashes_sysvar.data.borrow()[0..size_of::<SlotHash>()];
+        let random_bytes = hashv(&[hash.h.as_slice(), slot_hash]).0;
         
-        if is_winner {
+        // Convert first 8 bytes to u64 for much larger range
+        let random_value = u64::from_le_bytes(random_bytes[0..8].try_into().unwrap());
+        
+        // This miner wins if: random_value % total_miners == their position
+        if random_value % bus.total_miners as u64 == bus.processed_miners as u64 {
             final_reward = final_reward.saturating_add(pool_reward);
         }
+        
+        bus.processed_miners = (bus.processed_miners + 1) % bus.total_miners;
     }
     // If there are 0 miners, we don't do anything with the pool
     // If there are 0 miners, we don't do anything with the pool
