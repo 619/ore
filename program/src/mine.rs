@@ -67,52 +67,106 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
         return Err(OreError::HashTooEasy.into());
     }
 
-    // Normalize the difficulty and calculate the total reward amount.
+    // Normalize the difficulty and calculate the reward amount.
     let normalized_difficulty = difficulty
         .checked_sub(config.min_difficulty as u32)
         .unwrap();
-    let total_reward = config
+    let mut reward = config
         .base_reward_rate
         .checked_mul(2u64.checked_pow(normalized_difficulty).unwrap())
         .unwrap();
 
-    // Pool of miners who submitted valid proofs.
-    let mut valid_miners: Vec<Pubkey> = Vec::new();
+    // Apply boosts.
+    let base_reward = reward;
+    let mut boost_rewards = [0u64; 3];
+    let mut applied_boosts = [Pubkey::new_from_array([0; 32]); 3];
+    for i in 0..3 {
+        if optional_accounts.len().gt(&(i * 2)) {
+            let boost_info = optional_accounts[i * 2].clone();
+            let stake_info = optional_accounts[i * 2 + 1].clone();
+            let boost = boost_info.as_account::<Boost>(&ore_boost_api::ID)?;
+            let stake = stake_info
+                .as_account::<Stake>(&ore_boost_api::ID)?
+                .assert(|s| s.authority == proof.authority)?
+                .assert(|s| s.boost == *boost_info.key)?;
 
-    // Add the current miner to the pool of valid miners.
+            if applied_boosts.contains(boost_info.key) {
+                continue;
+            }
+
+            applied_boosts[i] = *boost_info.key;
+
+            if boost.expires_at.gt(&t)
+                && boost.total_stake.gt(&0)
+                && stake.last_stake_at.saturating_add(ONE_MINUTE).le(&t)
+            {
+                let multiplier = boost.multiplier.checked_sub(1).unwrap();
+                let boost_reward = (base_reward as u128)
+                    .checked_mul(multiplier as u128)
+                    .unwrap()
+                    .checked_mul(stake.balance as u128)
+                    .unwrap()
+                    .checked_div(boost.total_stake as u128)
+                    .unwrap() as u64;
+                reward = reward.checked_add(boost_reward).unwrap();
+                boost_rewards[i] = boost_reward;
+            }
+        }
+    }
+
+    // Apply liveness penalty.
+    let reward_pre_penalty = reward;
+    let t_liveness = t_target.saturating_add(TOLERANCE);
+    if t.gt(&t_liveness) {
+        let secs_late = t.saturating_sub(t_target) as u64;
+        let mins_late = secs_late.saturating_div(ONE_MINUTE as u64);
+        if mins_late.gt(&0) {
+            reward = reward.saturating_div(2u64.saturating_pow(mins_late as u32));
+        }
+
+        let remainder_secs = secs_late.saturating_sub(mins_late.saturating_mul(ONE_MINUTE as u64));
+        if remainder_secs.gt(&0) && reward.gt(&0) {
+            let penalty = reward
+                .saturating_div(2)
+                .saturating_mul(remainder_secs)
+                .saturating_div(ONE_MINUTE as u64);
+            reward = reward.saturating_sub(penalty);
+        }
+    }
+
+    // Apply bus limit.
+    let reward_actual = reward.min(bus.rewards).min(ONE_ORE);
+
+    // Add the miner to the pool of valid miners.
+    let mut valid_miners: Vec<Pubkey> = Vec::new();
     if !valid_miners.contains(&signer_info.key) {
         valid_miners.push(*signer_info.key);
     }
 
-    // Graceful exit if no miners exist.
+    // Graceful exit if there are no miners.
     let num_miners = valid_miners.len() as u64;
     if num_miners == 0 {
-        return Ok(()); // Do nothing if no miners are found.
+        return Ok(());
     }
 
-    // Calculate the per-miner share based on the total number of miners.
-    let per_miner_share = total_reward / num_miners;
-
-    // Distribute 31% of the per-miner share to the current miner.
+    // Calculate per-miner share and distribute 31% guaranteed reward.
+    let per_miner_share = reward_actual / num_miners;
     let guaranteed_share = (per_miner_share as f64 * 0.31) as u64;
     proof.balance = proof.balance.checked_add(guaranteed_share).unwrap();
     bus.rewards = bus.rewards.checked_sub(guaranteed_share).unwrap();
 
-    // Pool the remaining reward for the lottery.
-    let pooled_share = (total_reward as f64 * 0.69) as u64;
-
-    // Select one random miner from the pool using the block hash.
+    // Pool the remaining 69% for the lottery.
+    let pooled_share = (reward_actual as f64 * 0.69) as u64;
     let block_hash = hashv(&[slot_hashes_sysvar.data.borrow()]);
     let miner_index = (block_hash.as_ref()[0] as usize) % valid_miners.len();
     let selected_miner = valid_miners[miner_index];
 
-    // Assign the pooled reward to the selected miner.
     if selected_miner == *signer_info.key {
         proof.balance = proof.balance.checked_add(pooled_share).unwrap();
         bus.rewards = bus.rewards.checked_sub(pooled_share).unwrap();
     }
 
-    // Update stats.
+    // Update stats and log data.
     proof.last_hash = hash.h;
     proof.challenge = hashv(&[
         hash.h.as_slice(),
@@ -120,21 +174,8 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     ])
     .0;
 
-    proof.total_rewards = proof.total_rewards.saturating_add(total_reward);
+    proof.total_rewards = proof.total_rewards.saturating_add(reward_actual);
     proof.total_hashes = proof.total_hashes.saturating_add(1);
-
-    // Log the mining event.
-    MineEvent {
-        balance: proof.balance,
-        difficulty: difficulty as u64,
-        last_hash_at: proof.last_hash_at,
-        timing: t.saturating_sub(t_target),
-        reward: total_reward,
-        boost_1: 0,
-        boost_2: 0,
-        boost_3: 0,
-    }
-    .log_return();
 
     Ok(())
 }
