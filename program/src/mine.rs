@@ -109,6 +109,7 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
                     .checked_div(boost.total_stake as u128)
                     .unwrap() as u64;
                 reward = reward.checked_add(boost_reward).unwrap();
+
                 boost_rewards[i] = boost_reward;
             }
         }
@@ -136,11 +137,27 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
 
     // Apply bus limit.
     let reward_actual = reward.min(bus.rewards).min(ONE_ORE);
+    
+    // Calculate base reward (31%) and pool reward (69%)
+    let base_reward_portion = (reward_actual as u128)
+        .checked_mul(31)
+        .unwrap()
+        .checked_div(100)
+        .unwrap() as u64;
+    let pool_reward_portion = reward_actual.saturating_sub(base_reward_portion);
+
+    // Use the block hash to determine if this miner wins the pool
+    let is_winner = hash.h[0] == 0; // Simple example using first byte, adjust as needed
+    let final_reward = if is_winner {
+        base_reward_portion.saturating_add(pool_reward_portion)
+    } else {
+        base_reward_portion
+    };
 
     // Update balances.
     bus.theoretical_rewards = bus.theoretical_rewards.checked_add(reward).unwrap();
     bus.rewards = bus.rewards.checked_sub(reward_actual).unwrap();
-    proof.balance = proof.balance.checked_add(reward_actual).unwrap();
+    proof.balance = proof.balance.checked_add(final_reward).unwrap();
 
     // Hash a recent slot hash into the next challenge to prevent pre-mining attacks.
     proof.last_hash = hash.h;
@@ -154,12 +171,12 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let prev_last_hash_at = proof.last_hash_at;
     proof.last_hash_at = t.max(t_target);
     proof.total_hashes = proof.total_hashes.saturating_add(1);
-    proof.total_rewards = proof.total_rewards.saturating_add(reward_actual);
+    proof.total_rewards = proof.total_rewards.saturating_add(final_reward);
 
     // Log data.
     for i in 0..3 {
         boost_rewards[i] = (boost_rewards[i] as u128)
-            .checked_mul(reward_actual as u128)
+            .checked_mul(final_reward as u128)
             .unwrap()
             .checked_div(reward_pre_penalty as u128)
             .unwrap() as u64;
@@ -169,7 +186,7 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
         difficulty: difficulty as u64,
         last_hash_at: prev_last_hash_at,
         timing: t.saturating_sub(t_liveness),
-        reward: reward_actual,
+        reward: final_reward,
         boost_1: boost_rewards[0],
         boost_2: boost_rewards[1],
         boost_3: boost_rewards[2],
@@ -180,15 +197,6 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
 }
 
 /// Authenticate the proof account.
-///
-/// This process is necessary to prevent sybil attacks. If a user can pack multiple hashes into a single
-/// transaction, then there is a financial incentive to mine across multiple keypairs and submit as many hashes
-/// as possible in the same transaction to minimize fee / hash.
-///
-/// We prevent this by forcing every transaction to declare upfront the proof account that will be used for mining.
-/// The authentication process includes passing the 32 byte pubkey address as instruction data to a CU-optimized noop
-/// program. We parse this address through transaction introspection and use it to ensure the same proof account is
-/// used for every `mine` instruction in a given transaction.
 fn authenticate(data: &[u8], proof_address: &Pubkey) -> ProgramResult {
     if let Ok(Some(auth_address)) = parse_auth_address(data) {
         if proof_address.ne(&auth_address) {
@@ -202,33 +210,25 @@ fn authenticate(data: &[u8], proof_address: &Pubkey) -> ProgramResult {
 
 /// Use transaction introspection to parse the authenticated pubkey.
 fn parse_auth_address(data: &[u8]) -> Result<Option<Pubkey>, SanitizeError> {
-    // Start the current byte index at 0
     let mut curr = 0;
     let num_instructions = read_u16(&mut curr, data)?;
     let pc = curr;
 
-    // Iterate through the transaction instructions
     for i in 0..num_instructions as usize {
-        // Shift pointer to correct positition
         curr = pc + i * 2;
         curr = read_u16(&mut curr, data)? as usize;
 
-        // Skip accounts
         let num_accounts = read_u16(&mut curr, data)? as usize;
         curr += num_accounts * 33;
 
-        // Read the instruction program id
         let program_id = read_pubkey(&mut curr, data)?;
 
-        // Introspect on the first noop instruction
         if program_id.eq(&NOOP_PROGRAM_ID) {
-            // Return address read from instruction data
             curr += 2;
             let address = read_pubkey(&mut curr, data)?;
             return Ok(Some(address));
         }
     }
 
-    // Default return none
     Ok(None)
 }
