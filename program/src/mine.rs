@@ -136,23 +136,43 @@ pub fn process_mine(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     }
 
     // Apply bus limit.
-    let reward_actual = reward.min(bus.rewards).min(ONE_ORE);
+    let reward_actual = reward.min(bus.rewards).min(1);
     
-    // Calculate base reward (31%) and pool reward (69%)
+    // Apply bus limit.
+    let reward_actual = reward.min(bus.rewards).min(ONE_ORE);
+
+    // Each miner gets 31% of their earned reward based on difficulty
     let base_reward_portion = (reward_actual as u128)
         .checked_mul(31)
         .unwrap()
         .checked_div(100)
         .unwrap() as u64;
-    let pool_reward_portion = reward_actual.saturating_sub(base_reward_portion);
 
-    // Use the block hash to determine if this miner wins the pool
-    let is_winner = hash.h[0] == 0; // Simple example using first byte, adjust as needed
-    let final_reward = if is_winner {
-        base_reward_portion.saturating_add(pool_reward_portion)
-    } else {
-        base_reward_portion
-    };
+    let mut final_reward = base_reward_portion;
+
+    // The pool is always 69% of ONE_ORE
+    let pool_reward = (ONE_ORE as u128)
+        .checked_mul(69)
+        .unwrap()
+        .checked_div(100)
+        .unwrap() as u64;
+
+    // Check if this is the only miner by looking at the total miners count in the bus
+    let is_only_miner = bus.total_miners == 1;
+    
+    // If they're the only miner, they automatically win the pool
+    if is_only_miner {
+        final_reward = final_reward.saturating_add(pool_reward);
+    } else if bus.total_miners > 1 {
+        // If there are multiple miners, use the hash to pick a winner
+        let is_winner = hash.h[0] <= (255 / bus.total_miners); // Probability of 1/total_miners
+        
+        if is_winner {
+            final_reward = final_reward.saturating_add(pool_reward);
+        }
+    }
+    // If there are 0 miners, we don't do anything with the pool
+    // If there are 0 miners, we don't do anything with the pool
 
     // Update balances.
     bus.theoretical_rewards = bus.theoretical_rewards.checked_add(reward).unwrap();
